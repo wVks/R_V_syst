@@ -63,7 +63,11 @@ def calculate():
     return dict(mau=MAU, dau=DAU, orders_day=ORDERS_DAY, rows=rows,
                 totals=totals, storage=storage(), media_tb_day=media_bytes_day / 1e12,
                 media_peak_mbps=media_bytes_day / 86400 * 6 * 8 / 1e6,
-                media_origin_tb_day=media_bytes_day * 0.05 / 1e12)
+                media_origin_tb_day=media_bytes_day * 0.05 / 1e12,
+                wire_in_gb_day=(totals['in_gb_day'] + totals['requests_day'] * 300 / 1e9) * 1.3,
+                wire_out_gb_day=(totals['out_gb_day'] + totals['requests_day'] * 300 / 1e9) * 1.3,
+                wire_in_peak_mbps=(totals['in_peak_mbps'] + totals['peak_rps'] * 300 * 8 / 1e6) * 1.3,
+                wire_out_peak_mbps=(totals['out_peak_mbps'] + totals['peak_rps'] * 300 * 8 / 1e6) * 1.3)
 
 
 if __name__ == '__main__':

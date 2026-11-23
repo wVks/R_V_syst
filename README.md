@@ -105,11 +105,11 @@ MAU оценивается снизу: в выбранных городах пр
 | Трафик | Вход/сутки | Выход/сутки | Пиковый вход | Пиковый выход |
 |---|---:|---:|---:|---:|
 | Полезные данные API | 24,24 GB | 173,16 GB | 11,87 Mbit/s | 95,40 Mbit/s |
-| API с запасом 30% на заголовки/TLS | 31,51 GB | 225,11 GB | 15,43 Mbit/s | 124,02 Mbit/s |
+| API: 300 B накладных расходов/сообщение +30% резерв | 53,93 GB | 247,53 GB | 24,76 Mbit/s | 133,35 Mbit/s |
 | Изображения CDN → клиенты | — | 2,16 TB | — | 1 200 Mbit/s |
 | S3 → CDN, hit ratio 95% | — | 0,108 TB | — | 60 Mbit/s |
 
-Изображения: `300 000 × 24 страницы × 10 миниатюр × 30 kB = 2,16 TB/сутки`. Это консервативно, без повторного браузерного кэша. CDN не проходит через API. Умножение на пик 6 даёт 1,2 Gbit/s; origin обслуживает 5% промахов, но при холодном CDN возможны все 1,2 Gbit/s: нужны origin shield, request coalescing и ограничение fetch. API + CDN дают около 1,324 Gbit/s клиентского пика с транспортным запасом только для API. Внутренняя репликация, WAL и бэкапы добавляются при выборе сетей хранения.
+Изображения: `300 000 × 24 страницы × 10 миниатюр × 30 kB = 2,16 TB/сутки`. Это консервативно, без повторного браузерного кэша. CDN не проходит через API. Умножение на пик 6 даёт 1,2 Gbit/s; origin обслуживает 5% промахов, но при холодном CDN возможны все 1,2 Gbit/s: нужны origin shield, request coalescing и ограничение fetch. Для API сначала прибавляем 300 B заголовков/служебных данных к каждому запросу и ответу, затем умножаем на 1,3. Это особенно важно для коротких GPS; фактический overhead зависит от HTTP/2 reuse и TLS. API + CDN дают около 1,333 Gbit/s клиентского пика с этим транспортным запасом для API. Внутренняя репликация, WAL и бэкапы добавляются при выборе сетей хранения.
 
 Минимум для edge API — два независимых пути по 1 Gbit/s; серверная сеть хранения — 10 Gbit/s для восстановления и репликации. При росте ×2 ожидаем 5 983 RPS API и 2,4 Gbit/s CDN до запаса. Проверяем 1×/2×/4× профиль и отказ одной зоны.
 
@@ -307,6 +307,83 @@ k6 использует [открытую модель нагрузки](https:/
 
 План CI/CD реализации: GitHub Actions → unit/race/contract → integration → multi-stage OCI build → сканирование образа и SBOM → GHCR по immutable digest → staging → canary 5%/25%/100% с остановкой при росте ошибок/latency. Миграции — expand/contract; откат образа не откатывает данные. Секреты — через secret store/OIDC, не в git. Текущий CI проверяет документ и модель; выпуск сервисов и инфраструктуры начнётся после реализации. [GitHub Actions для Python](https://docs.github.com/en/actions/tutorials/build-and-test-code/python) описывает базовый механизм запуска проверок.
 
+## 6. Взаимодействие компонентов
+
+### 6.1. Протоколы и бюджеты
+
+| Инициатор → получатель | Тип / протокол / инструмент | Таймаут и повтор | Причина |
+|---|---|---|---|
+| Клиенты → Envoy → Profile/Catalog/Orders/Tracking | Sync HTTPS REST/JSON, OpenAPI | Чтение 1 s; checkout 2 s; GPS 1 s. POST повторяется клиентом только с idempotency key | Поддержка браузера/мобильных клиентов; простые статусы 202/409/429. GraphQL для фиксированных экранов добавляет сложность лимитов запросов |
+| Tracking → Orders (статус); Dispatch/Payments → Orders (команды) | Sync gRPC/protobuf, mTLS | Status 150 ms, команда 300 ms; ≤1 повтор только идемпотентной команды при UNAVAILABLE и остатке deadline | Типизированные внутренние контракты, компактный payload; один владелец состояния заказа |
+| Orders → ETA | Sync HTTP/JSON к FastAPI | Общий бюджет 80 ms, без retry; fallback по истечении | Простая интеграция Python runtime; необязательное улучшение прогноза, отдельный gRPC-wrapper не нужен |
+| Profile/Catalog/Orders/relay → PG | Sync SQL/pgx через PgBouncer | statement_timeout 300 ms, lock_timeout 100 ms; транзакция ≤500 ms; повтор всей короткой транзакции на deadlock ≤1 | ACID, индексы, блокировки. Relay имеет отдельную роль для outbox; Payments не пишет в таблицы напрямую |
+| Catalog/Tracking/Dispatch/ETA/stream → Redis | Sync RESP по TLS, go-redis или Python client | 20 ms на операцию, без каскадных retry | Кэш/геопозиция/признаки в RAM; при miss ограничиваем fallback на PG |
+| Orders → outbox → Kafka | Async transactional outbox + producer | DB commit независимо от Kafka; relay timeout 1 s, lease/retry; alert oldest_unsent >30 s | Не теряем событие между успешным commit заказа и публикацией в брокер |
+| Tracking → Kafka GPS; public APIs → Kafka analytics | Async после приёма события | GPS 202 после `acks=all`; retry с seq; аналитика best effort в bounded buffer | Отделяем поток от потребителей; сбой аналитики не отменяет бизнес-операцию |
+| Kafka → Payments/Dispatch/Notifications | Async consumer groups по orders.v1 | Consumer commit после durable результата, retry/DLQ ниже | Убирает PSP и уведомления из latency оформления; каждому виду обработки своя группа |
+| Kafka → stream workers → Redis | Async consumer + sync запись проекции | Обновление по seq, offset после записи; старые seq отбрасываются | Идемпотентное восстановление актуальной геопозиции/признаков после перезапуска |
+| Kafka → CH loader → ClickHouse | Async, native protocol TLS, batch insert | 10 000 строк или 5 s; insert timeout 5 s, retry того же batch | Меньше мелких частей; аналитика может отставать от заказов |
+| Payments ↔ PSP | Sync HTTPS с внешней идемпотентностью; async подписанный callback | connect 300 ms /total 2 s; на неопределённом результате сначала query by operation_id | У внешнего PSP нет общей транзакции с нашей БД; timeout не означает, что оплата не состоялась |
+| Notifications → Push/SMS | Async job → sync HTTPS | Total 2 s; квоты по каналу, ≤5 попыток, expiry 24 h | Отказ канала не блокирует заказ; повтор без provider idempotency может дублировать уведомление |
+| ETL/training ↔ ClickHouse/S3; serving → S3 | Batch SQL/HTTPS S3 API | Job deadline 2 h; model fetch 30 s вне пользовательского запроса; checksum | Воспроизводимые датасеты и immutable-версии модели; runtime держит last-known-good |
+| Клиенты → CDN → S3 | Sync HTTPS GET с версионированным URL | Edge cache, origin shield, отдельный лимит miss | Снимает медиатрафик с API, кэш можно восстанавливать независимо |
+| PG/pgBackRest → S3 → DR; exporters → observability | Async backup/WAL/telemetry | WAL age alert 60 s; scrape 15 s, exporter timeout 5 s | Проверяем восстановимость; телеметрия не участвует в транзакции пользователя |
+
+Внешний checkout возвращает `202 Accepted` с order_id после commit: это принятие заказа в обработку, а не подтверждение успешной оплаты. Бюджет 2 s включает edge, валидацию, запрос цены, DB и ответ; ETA ограничен 80 ms. На sync-цепочке передаётся меньший из исходного deadline и бюджета конкретного вызова. Отмена клиента прекращает необязательную работу; уже закоммиченный заказ остаётся доступен по ключу. [gRPC deadlines](https://grpc.io/docs/guides/deadlines/) нужны явно: отсутствие deadline может оставить зависший RPC без ограниченного срока.
+
+Прокси выполняет маршрутизацию и ограничения, клиенты — bounded retries и circuit breaker. Полный service mesh не оправдан при этом числе сервисов; mTLS выдаёт внутренний CA, сертификаты ротируются автоматически. Kafka использует TLS и ACL по topic/group; PostgreSQL — разные роли и parameterized SQL. PSP callback проходит проверку подписи, timestamp, provider_event_id и разрешённого перехода. PII и координаты не передаются в публичные логи.
+
+### 6.2. Транзакции, повторы и порядок
+
+**Создание и оплата.** В одной PG-транзакции Orders проверяет `UNIQUE(user_id, idempotency_key)`, сохраняет hash тела, снимок суммы/меню, order PENDING_PAYMENT, операцию AUTHORIZE и outbox. Повтор с тем же ключом/телом возвращает исходный order_id; с другим телом —409. Ключ хранится 7 дней (дольше retry/replay в 3 дня). Деньги — integer в минимальных единицах валюты, не float. Не держим DB-lock во время вызова PSP.
+
+Payments обрабатывает событие и отправляет PSP ключ `order_id:AUTHORIZE:v1`. Timeout оставляет PAYMENT_UNKNOWN, запускается сверка с PSP, а не новая оплата с новым ключом. Успешный callback/опрос вызывает идемпотентную команду Orders и переводит заказ в AUTHORIZED. Ресторан принимает заказ → CAPTURE_PENDING; успешный capture → COOKING. Отклонение до capture →void, после capture →refund, с отдельными operation_id и reconciliation. Заказ переходит к доставке через READY, DELIVERING, DELIVERED; отказ платежа/ресторана приводит к компенсирующему переходу, а не распределённому rollback. Клиент видит промежуточный статус. Это saga с проверяемыми переходами и компенсациями, **не** 2PC с внешним провайдером.
+
+**Конкурентные команды.** READ COMMITTED +`SELECT ... FOR UPDATE` строки заказа, проверка текущего state/version, уникальность `provider_operation_id` и `(order_id, operation_type, operation_version)` предотвращают двойной capture/refund. Для courier_id — partial UNIQUE на заказах с активным delivery_state ASSIGNED/PICKED_UP; освобождение при завершении/отмене. Выбор кандидата в Redis не является резервированием. Даже если два Dispatch выбрали одного курьера, только одна транзакция Orders назначит его. [Изоляция транзакций](https://www.postgresql.org/docs/17/transaction-iso.html) и [блокировки PostgreSQL](https://www.postgresql.org/docs/17/explicit-locking.html) не отменяют необходимости явно задавать инварианты в constraints.
+
+**Outbox.** Три relay используют lease фиксированных hash-lanes по order_id и читают события в sequence одного заказа; lease выдаётся короткой DB-транзакцией через `SKIP LOCKED`. Сеть выполняется после commit lease, DB-транзакция не держится до Kafka. После `acks=all` событие помечается sent. Падение после publish до mark даёт дубль: envelope содержит event_id, aggregate_id, aggregate_version, occurred_at, schema_version, traceparent. `enable.idempotence=true` устраняет часть producer-дублей, но не повторную публикацию после перезапуска relay.
+
+**Consumer.** Доставка — at-least-once. Критический consumer передаёт event_id в Orders; inbox/dedup и изменение состояния коммитятся вместе. Offset подтверждается после результата. Inbox на 7 дней, постоянные business UNIQUE — на весь срок платёжной истории 365 дней; служебные данные входят в запас PG §4.2. Replay старых архивов выполняется отдельной аналитической группой и не вызывает платежи/уведомления. Уведомлениям старше 24 h запрещена повторная отправка. Для PSP гарантируем отсутствие повторной бизнес-операции только при подтверждённой поддержке его idempotency/query API; её отсутствие — блокер подключения PSP.
+
+**Ordering и retry.** Kafka key=order_id для orders и courier_id для GPS; порядок есть только внутри partition. Для временных ошибок — exponential backoff с full jitter: 1 s, 5 s, 30 s, 2 min, 10 min; далее DLQ и оповещение. Poison-событие уходит в DLQ сразу с причиной, версией схемы и ссылкой на исходные topic/partition/offset. Для критического заказа паркуется только этот aggregate_id; другие ключи продолжаются. Пропущенная aggregate_version не применяется вслепую: consumer запрашивает авторитетный snapshot Orders, ждёт gap до 30 s, затем создаёт инцидент/задачу reconciliation. Для GPS более старый seq безопасно отбрасывается. Это учитывает, что retry-topic способен изменить порядок.
+
+Нет end-to-end exactly-once для цепочки PG→Kafka→PSP. Kafka transactions могли бы атомарно связывать чтение/запись Kafka, но не SQL commit или платёж. Поэтому здесь outbox/inbox и idempotency, а не заявление о глобальной exactly-once. Основание границ гарантий: [Kafka design](https://kafka.apache.org/41/design/design/).
+
+### 6.3. Таймауты и наблюдаемость взаимодействий
+
+Общие retry budgets: только один уровень повторяет один вызов, суммарные дополнительные попытки ≤10% нормального потока; при исчерпании deadline новый retry запрещён. Circuit breaker для PSP/ETA/поиска раздельный: окно 30 s, не менее 20 запросов, >50% технических ошибок →open на 15 s, затем 3 half-open пробы. Бизнес-отказ оплаты не считается технической ошибкой. Bounded queues и semaphore ограничивают inflight, а не накапливают бесконечную память.
+
+OTel передаёт traceparent в HTTP/gRPC и Kafka headers; async consumer создаёт processing span со связью на producer span, даже если прошло несколько минут. Снимаем client/server latency, deadline_exceeded, retry count, breaker state, queue wait, age oldest outbox, lag по каждой группе, DLQ rate, длительность от order commit до restaurant acknowledgement. Лог содержит event_id/order_id/trace_id и outcome; чувствительные тела, токены и номера карт исключены. Метрики имеют ограниченные labels service/operation/status/topic/group; order_id остаётся в trace/log. [OTel messaging conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/) — основа связи producer/consumer, trace не приравнивается к транзакционной гарантии.
+
+## 7. Обработка данных и ETA
+
+### 7.1. Потоки и специализированные инструменты
+
+| Задача | Инструмент и алгоритм | Нагрузка / ресурсы из §5.3 | Почему выбран / альтернатива |
+|---|---|---|---|
+| Текущие GPS и онлайн-признаки | Go consumers, Redis HASH/GEO, seq compare; скользящие 5 min агрегаты | 43,2 млн GPS/день, до 2000/s; 3×2 vCPU/4 GiB stream workers | Простая key-based обработка, нет глобальных joins и состояния TB. Flink с checkpointing будет полезен при сложных event-time joins, но пока добавляет отдельный кластер |
+| История и продуктовые воронки | CH loader →ClickHouse, batch 10 тыс./5 s; SQL materialized views | Всего 50,4 млн событий/день, до ~2500/s; loader 3×1/2 +CH из §4.3 | Колоночные агрегации и дешёвый replay; Kafka Streams/JVM для этих преобразований не требуется |
+| ETL / очистка | Python +Polars, SQL в CH, CronJob, Parquet в S3 | Daily до 50,4 млн событий, потоковое чтение; 2×2/4 координации, крупный Job использует временный бюджет 8/16 | Не загружаем все сырые события в Python RAM. Airflow/dbt оправданы при большом DAG/команде; для нескольких идемпотентных заданий CronJob проще |
+| Контроль платежей / зависших заказов | Идемпотентный reconciliation job в домене Orders | Каждую минуту, ограниченные пачки по 100 записей и индекс next_check_at; выполняет существующий Payments/Dispatch | Персистентный статус в PG надёжнее таймера в памяти или одного сообщения с delayed retry |
+| ETA обучение | scikit-learn histogram gradient boosting, экспорт ONNX с golden tests | До 3,6 млн завершённых заказов/30 дней ×40 float32 =576 MB чистой матрицы; Job 8 vCPU/16 GiB, target ≤2 h/сутки | Табличные временные/географические признаки, без текстовых embeddings. GPU/TPU не нужны; лёгкая модель дешевле большой нейросети |
+| ETA inference | FastAPI +ONNX Runtime CPU, last-known-good | До ~225 RPS (статусы +checkout +dispatch), рост ×2 ~450; 3×2 vCPU/2 GiB | Цель ≤1 ms CPU/inference — sizing-гипотеза; CPU ~0,225 ядра базово, запас — для HTTP/native runtime/HA. Triton/TensorRT не оправданы без GPU |
+
+[scikit-learn gradient boosting](https://scikit-learn.org/stable/modules/ensemble.html#histogram-based-gradient-boosting) выбран для табличной регрессии; возможность точного экспорта конкретных операторов подтверждается golden-тестами до выбора финального конвертера. [ONNX Runtime threading](https://onnxruntime.ai/docs/performance/tune-performance/threading.html): 2 Uvicorn workers/pod, intra_op_num_threads=1, inter_op_num_threads=1, чтобы три native thread pool не переподписали два CPU. Модель ≤50 MB, датасеты/артефакты вращаются lifecycle в общем бюджете 10 GB; ежегодные training snapshots не сохраняются бесконечно.
+
+Stream использует server_received_at, courier_id и монотонный seq в рамках session_id; при смене сессии нужен новый server-issued epoch. Допустимое опоздание для временных агрегатов —2 min; поздние GPS сохраняются в истории, но не откатывают текущую позицию. Состояние 5-min окна ограничено по ключам/TTL, не хранит все 43,2 млн точек в RAM. Replay начинается из Kafka после сбоя; текущий Redis может восстановиться по свежим GPS без полного replay.
+
+ClickHouse-повторы дедуплицируются по стабильному batch token в штатном окне dedup; на длительном replay записи имеют event_id, аналитические витрины используют явную дедупликацию (argMax/уникальный event_id до агрегирования). Нельзя складывать повторённые события простым SUM и полагаться на будущий merge. Сырые дубли ограничены retention; daily reconciliation сравнивает число уникальных order/event_id с PG. Для потребителей целевой устойчивый throughput ≥5000 events/s — вдвое выше базового пика, проверяемый нагрузочным тестом.
+
+### 7.2. Качество и безопасное включение модели
+
+Цель ETA — прогноз минут до доставки; признаки: расстояние PostGIS, время суток/день недели, стадия заказа, наблюдаемая загрузка ресторана и свежесть/скорость курьера. Нет данных карты дорог: расстояние — геодезическое с обученным коэффициентом, точность ограничена, сложные маршруты требуют отдельного routing-сервиса. Baseline — медиана времени по городу/ресторану/часу плюс оценка пути, при малой выборке — медиана города.
+
+Train/validation/test разделяются по времени (последние 7 дней — test), все признаки формируются только из информации, доступной на момент предсказания; фактическое delivered_at используется лишь как label. Метрики: MAE в минутах, p90 абсолютной ошибки, доля прогнозов в ±5 min по городам/ресторанам, coverage и feature missingness. Проектная цель для включения: MAE ≤5 min, p90 ≤12 min и минимум 10% улучшения baseline; это критерии, а не достигнутые результаты.
+
+Pipeline: выборка →валидация схем/диапазонов/дубликатов →обучение →offline test и golden ONNX parity →версионированный manifest с checksum →shadow →canary 5% →раскатка. Last-known-good остаётся в памяти; отсутствие модели/признаков или превышение 80 ms даёт baseline без отказа checkout. Проверяем drift по распределению признаков и задержанный MAE после завершения заказов; деградация >20% относительно baseline за сутки отключает новую версию. Заказ, платёж и назначение никогда не зависят от успешности AI.
+
+CronJob: `concurrencyPolicy=Forbid`, timezone UTC, deadline, ограниченный history и idempotency по `(job_name, logical_date)`. [Kubernetes CronJob](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/) не обещает exactly-once запуск, поэтому результат пишется во временный путь и публикуется атомарной сменой manifest после проверок. Большой workflow engine/feature store пока заменяют простые PG-задания, Redis online-признаки и CH offline-история с общей версией преобразований.
+
 ## Источники
 
 1. [Яндекс Еда: рекорд заказов, 10.03.2025](https://ir.yandex.ru/press-releases?id=01-10-03-2025&year=2025).
@@ -320,7 +397,7 @@ k6 использует [открытую модель нагрузки](https:/
 | 2 | Продуктовые и технические метрики; балансировка | Выполнен |
 | 3 | Системы хранения и их эксплуатация | Выполнен |
 | 4 | Программные компоненты, схема, оборудование и инструменты разработки | Выполнен |
-| 5 | Взаимодействия и обработка данных | Следующий этап |
-| 6 | Надёжность и инцидент-менеджмент | Предстоит |
+| 5 | Взаимодействия и обработка данных | Выполнен |
+| 6 | Надёжность и инцидент-менеджмент | Следующий этап |
 
 Этап 1 соответствует вводному описанию проекта; этапы 2–6 — пяти тематическим заданиям. README дополняется последовательно; отдельный коммит и тег фиксируют результат каждого этапа. Даты коммитов соответствуют фактическому выполнению работы.
