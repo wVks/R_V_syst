@@ -1,0 +1,20 @@
+name: Validate architecture document
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Recalculate capacity
+        run: python3 scripts/capacity.py
+      - name: Check document and diagram
+        run: python3 scripts/check_document.py
+      - name: Check whitespace
+        run: git diff --check HEAD

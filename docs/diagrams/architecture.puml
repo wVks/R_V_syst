@@ -1,0 +1,54 @@
+@startuml
+!pragma layout smetana
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 15
+skinparam ArrowColor #476078
+skinparam componentBackgroundColor #eef5fc
+skinparam databaseBackgroundColor #fff4d8
+skinparam nodesep 35
+skinparam ranksep 40
+top to bottom direction
+title Ryadom - delivery aggregator\nPrimary region / 3 availability zones
+actor "Buyers, restaurants, couriers" as client
+cloud "CDN" as cdn
+component "L4 load balancer\nEnvoy Gateway x3\nTLS / JWT / rate limits" as edge
+component "Public API services\nProfile | Catalog/Search\nOrders | Tracking" as api
+component "ETA inference\nFastAPI / ONNX CPU" as eta
+database "Redis Cluster\n3 primary + 3 replica\ncache / live GPS / features" as redis
+database "PostgreSQL + PostGIS\nprimary + 2 standby\nPgBouncer / Patroni / etcd" as pg
+component "Outbox relay" as relay
+queue "Kafka / KRaft\norders | GPS | analytics\nRF=3 / 24 partitions per topic" as kafka
+component "Order event workers\nPayments | Dispatch | Notifications\ngRPC commands to Orders API" as workers
+component "Data pipelines\nStream aggregation / CH loader\nETL / training" as pipeline
+cloud "Payment / Push providers" as external
+database "ClickHouse\n1 shard / 2 replicas\nKeeper x3" as ch
+storage "S3-compatible storage\nmedia / model artifacts\nPG full backups / WAL" as s3
+storage "DR backup\nseparate region/account" as dr
+client --> edge : HTTPS API
+client --> cdn : images
+edge --> api : REST
+api --> pg : SQL transaction + outbox
+api --> redis : cache / latest GPS
+api --> eta : optional HTTP
+api --> kafka : GPS / analytics
+eta --> redis : features
+pg --> relay : pending events
+relay --> kafka : publish
+kafka --> workers : order events
+kafka --> pipeline : consumer groups
+workers --> external : HTTPS / idempotency
+pipeline --> ch : batch inserts / ETL
+pipeline --> s3 : datasets / models
+pg --> s3 : pgBackRest
+cdn --> s3 : origin fetch
+s3 --> dr : backup copy
+legend bottom
+Separate table in README lists each service and its resources.
+Workers send gRPC commands to Orders; only Orders changes order state.
+ETA loads its model from S3; stream workers refresh Redis features.
+All layers export OTel / Prometheus telemetry to Grafana / Loki / Tempo.
+Arrows: request or data direction; responses and telemetry links omitted.
+endlegend
+@enduml
