@@ -17,4 +17,4 @@ jobs:
       - name: Check document and diagram
         run: python3 scripts/check_document.py
       - name: Check whitespace
-        run: git diff --check HEAD
+        run: git show --format= --check HEAD

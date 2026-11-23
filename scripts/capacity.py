@@ -37,12 +37,14 @@ def storage():
     ch = (43200000 * 7 * 100 + 1200000 * 365 * 500 + 6000000 * 90 * 200) / 1e12
     redis = (1000000 * 2000 + 150000 * 2000 + 20000 * 500 + 1000000 * 500) / 1e12
     backup = 2 * pg * 2 + 14 * 0.02
+    ch_backup = 2 * ch / 4 + 14 * (4.32 + .6 + 1.2) / 1000 / 4
+    objects = .3 + .03 + backup + ch_backup + .01
     metrics = 500000 * (86400 // 15) * 14 * 2 / 1e12
     logs_traces = (57480000 * 300 + .01 * 57480000 * 1000) * 14 / 4 / 1e12
     copies_now = dict(postgres=pg * 2 * 3, redis_ram=redis * 3 * 2,
                       kafka=kafka * 1.2 * 3, clickhouse=ch / 4 * 1.3 * 2,
-                      s3=(.3 + backup + .01) * 1.5,
-                      s3_dr=backup * 1.5, prometheus=metrics * 2,
+                      s3=objects * 1.5,
+                      s3_dr=objects * 1.5, prometheus=metrics * 2,
                       logs_traces=logs_traces * 1.5)
     return dict(postgres_rows=sum(n for _, n, _ in POSTGRES),
                 postgres_raw_tb=pg, copies_now_tb=copies_now,

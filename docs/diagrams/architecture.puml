@@ -24,7 +24,7 @@ component "Order event workers\nPayments | Dispatch | Notifications\ngRPC comman
 component "Data pipelines\nStream aggregation / CH loader\nETL / training" as pipeline
 cloud "Payment / Push providers" as external
 database "ClickHouse\n1 shard / 2 replicas\nKeeper x3" as ch
-storage "S3-compatible storage\nmedia / model artifacts\nPG full backups / WAL" as s3
+storage "S3-compatible storage\nmedia / model artifacts\nPG + CH backups / WAL" as s3
 storage "DR backup\nseparate region/account" as dr
 client --> edge : HTTPS API
 client --> cdn : images
@@ -41,6 +41,7 @@ kafka --> pipeline : consumer groups
 workers --> external : HTTPS / idempotency
 pipeline --> ch : batch inserts / ETL
 pipeline --> s3 : datasets / models
+ch --> s3 : backup
 pg --> s3 : pgBackRest
 cdn --> s3 : origin fetch
 s3 --> dr : backup copy
